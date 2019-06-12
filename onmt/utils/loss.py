@@ -25,6 +25,18 @@ def build_loss_compute(model, tgt_vocab, opt, train=True):
 
     return compute
 
+def build_loss_compute_ans(model, tgt_vocab, opt, train=True):
+    """
+    This returns user-defined LossCompute object, which is used to
+    compute loss in train/validate process. You can implement your
+    own *LossCompute class, by subclassing LossComputeBase.
+    """
+    device = torch.device("cuda" if onmt.utils.misc.use_gpu(opt) else "cpu")
+    compute = S2SLossCompute(model.ans_generator, tgt_vocab)
+    compute.to(device)
+
+    return compute
+
 
 class S2SLossCompute(nn.Module):
     """

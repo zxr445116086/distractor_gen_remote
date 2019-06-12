@@ -15,7 +15,7 @@ import torch
 
 import onmt.inputters as inputters
 import onmt.utils
-from onmt.utils.loss import build_loss_compute
+from onmt.utils.loss import build_loss_compute, build_loss_compute_ans
 
 from onmt.utils.logging import logger
 
@@ -40,13 +40,16 @@ def build_trainer(opt, device_id, model, fields,
     valid_loss = build_loss_compute(
         model, fields["tgt"].vocab, opt, train=False)
 
+    train_loss_ans = build_loss_compute_ans(
+        model, fields["answer"].vocab, opt)
+
     # trunc_size = opt.truncated_decoder  # Badly named...
     # shard_size = opt.max_generator_batches
     # norm_method = opt.normalization
     # grad_accum_count = opt.accum_count
 
     report_manager = onmt.utils.build_report_manager(opt)
-    trainer = onmt.Trainer(model, train_loss, valid_loss, optim,
+    trainer = onmt.Trainer(model, train_loss_ans, train_loss, valid_loss, optim,
                            data_type=data_type,
                            report_manager=report_manager,
                            model_saver=model_saver)
@@ -78,12 +81,13 @@ class Trainer(object):
                 Thus nothing will be saved if this parameter is None
     """
 
-    def __init__(self, model, train_loss, valid_loss, optim,
+    def __init__(self, model, train_loss_ans, train_loss, valid_loss, optim,
                  trunc_size=0, shard_size=32, data_type='text',
                  norm_method="sents", grad_accum_count=1,
                  report_manager=None, model_saver=None):
         # Basic attributes.
         self.model = model
+        self.train_loss_ans = train_loss_ans
         self.train_loss = train_loss
         self.valid_loss = valid_loss
         self.optim = optim
@@ -132,24 +136,29 @@ class Trainer(object):
 
         while step <= train_steps:
             for i, batch in enumerate(data_iter("train")):
-                self._gradient_accumulation(
-                    batch, batch.batch_size, total_stats,
-                    report_stats)
+                if (i // (1024 // batch.batch_size)) % 2 == 1:
+                    self._gradient_accumulation(
+                        batch, batch.batch_size, total_stats,
+                        report_stats)
 
-                report_stats = self._maybe_report_training(
-                    step, train_steps,
-                    self.optim.learning_rate,
-                    report_stats)
+                    report_stats = self._maybe_report_training(
+                        step, train_steps,
+                        self.optim.learning_rate,
+                        report_stats)
 
-                if step % valid_steps == 0:
-                    valid_stats = self.validate(data_iter("valid"))
-                    self._report_step(self.optim.learning_rate,
-                                      step, valid_stats=valid_stats)
+                    if step % valid_steps == 0:
+                        valid_stats = self.validate(data_iter("valid"))
+                        self._report_step(self.optim.learning_rate,
+                                          step, valid_stats=valid_stats)
 
-                self._maybe_save(step)
-                step += 1
-                if step > train_steps:
-                    break
+                    self._maybe_save(step)
+                    step += 1
+                    if step > train_steps:
+                        break
+                else:
+                    self._gradient_accumulation_ans(
+                        batch, batch.batch_size, total_stats,
+                        report_stats)
         return total_stats
 
     def validate(self, valid_iter):
@@ -207,6 +216,45 @@ class Trainer(object):
         self.model.zero_grad()
         outputs, attns, dec_state = \
             self.model(batch.src[0], batch.question[0],
+                       batch.answer[0], batch.tgt,
+                       batch.src[1], batch.src[2],
+                       batch.question[1], batch.answer[1],
+                       dec_state)
+        return outputs, attns, dec_state
+
+    def _gradient_accumulation_ans(self, batch, normalization, total_stats,
+                               report_stats):
+
+        outputs, attns, dec_state = self._forward_prop_ans(batch)
+
+        # 3. Compute loss in shards for memory efficiency.
+        batch_stats = self.train_loss_ans.compute_loss(
+            batch, outputs, attns, normalization)
+        total_stats.update(batch_stats)
+        report_stats.update(batch_stats)
+
+        self.optim.step()
+
+        if dec_state is not None:
+            dec_state.detach()
+
+    def _forward_prop_ans(self, batch):
+        """forward propagation"""
+        # 1, Get all data
+        dec_state = None
+
+        # here we use the last word of question as the first word of distractor
+        # to make the distractor linguistically obey the language model
+        ques, ques_length = batch.question[0], batch.question[1]
+        tgt_origin = batch.answer[0][1:,]
+        last_ques = torch.stack([ques[:, i][ques_length[i] - 1] for i in range(ques_length.size(0))])
+        last_ques = last_ques.unsqueeze(0)
+        batch.tgt = torch.cat([last_ques, tgt_origin], 0)
+
+        # 2. F-prop all but generator.
+        self.model.zero_grad()
+        outputs, attns, dec_state = \
+            self.model.forward_ans(batch.src[0], batch.question[0],
                        batch.answer[0], batch.tgt,
                        batch.src[1], batch.src[2],
                        batch.question[1], batch.answer[1],

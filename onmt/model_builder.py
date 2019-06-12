@@ -11,7 +11,7 @@ import onmt.inputters as inputters
 
 from onmt.distractor.embeddings import Embeddings
 from onmt.distractor.encoder import DistractorEncoder
-from onmt.distractor.decoder import HierDecoder
+from onmt.distractor.decoder import HierDecoder, HierDecoderAns
 from onmt.distractor.model import DGModel
 
 from onmt.utils.misc import use_gpu
@@ -120,9 +120,30 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None):
                           model_opt.dropout,
                           tgt_embeddings)
 
+    # Build ans_decoder.
+    ans_dict = fields["answer"].vocab
+    feature_dicts = inputters.collect_feature_vocabs(fields, 'answer')
+    ans_embeddings = build_embeddings(model_opt, ans_dict,
+                                      feature_dicts, for_encoder=False)
+
+    # Share the embedding matrix - preprocess with share_vocab required.
+    if model_opt.share_embeddings:
+        # src/tgt vocab should be the same if `-share_vocab` is specified.
+        if src_dict != ans_dict:
+            raise AssertionError('The `-share_vocab` should be set during '
+                                 'preprocess if you use share_embeddings!')
+        ans_embeddings.word_lut.weight = src_embeddings.word_lut.weight
+
+    ans_bidirectional_encoder = True if model_opt.question_init_type == 'brnn' else False
+    ans_decoder = HierDecoderAns(model_opt.rnn_type, ans_bidirectional_encoder,
+                          model_opt.dec_layers, model_opt.rnn_size,
+                          model_opt.global_attention,
+                          model_opt.dropout,
+                          ans_embeddings)
+
     # Build NMTModel(= encoder + decoder).
     device = torch.device("cuda" if gpu else "cpu")
-    model = DGModel(encoder, decoder)
+    model = DGModel(encoder, decoder, ans_decoder)
 
     # Build Generator.
     gen_func = nn.LogSoftmax(dim=-1)
@@ -131,11 +152,19 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None):
         gen_func
     )
 
+    # Build AnsGenerator.
+    ans_gen_func = nn.LogSoftmax(dim=-1)
+    ans_generator = nn.Sequential(
+        nn.Linear(model_opt.dec_rnn_size, len(fields["answer"].vocab)),
+        ans_gen_func
+    )
+
 
     # Load the model states from checkpoint or initialize them.
     if checkpoint is not None:
         model.load_state_dict(checkpoint['model'], strict=False)
         generator.load_state_dict(checkpoint['generator'], strict=False)
+        ans_generator.load_state_dict(checkpoint['ans_generator'], strict=False)
     else:
         if model_opt.param_init != 0.0:
             for p in model.parameters():
@@ -156,9 +185,13 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None):
         if hasattr(model.decoder, 'embeddings'):
             model.decoder.embeddings.load_pretrained_vectors(
                 model_opt.pre_word_vecs_dec, model_opt.fix_word_vecs_dec)
+        if hasattr(model.ans_decoder, 'embeddings'):
+            model.ans_decoder.embeddings.load_pretrained_vectors(
+                model_opt.pre_word_vecs_dec, model_opt.fix_word_vecs_dec)
 
     # Add generator to model (this registers it as parameter of model).
     model.generator = generator
+    model.ans_generator = ans_generator
     model.to(device)
 
     return model
